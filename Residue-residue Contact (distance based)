@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""XP dimer mean minimum interchain residue distance, 50–100 ns.
+
+Run inside ncap_system:
+    python ncap_mean_smallest_distance.py dimer_fresh.pdb dimer_fresh.xtc
+
+Assumes first 42 protein residues are monomer A, next 42 monomer B.
+"""
+
+import argparse
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import MDAnalysis as mda
+from MDAnalysis.lib.distances import distance_array
+import numpy as np
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("topology", help="Protein-only PDB matching trajectory atom order")
+    p.add_argument("trajectory", help="Protein-only XTC with periodic box")
+    p.add_argument("--start-ns", type=float, default=50.0)
+    p.add_argument("--end-ns", type=float, default=100.0)
+    p.add_argument("--stride", type=int, default=1,
+                   help="Analyze every nth saved frame (default: every frame)")
+    p.add_argument("--prefix", default="ncap_B_vs_A_50_100ns")
+    args = p.parse_args()
+    if args.stride < 1 or args.end_ns < args.start_ns:
+        p.error("Need stride >= 1 and end-ns >= start-ns")
+
+    u = mda.Universe(args.topology, args.trajectory)
+    protein = u.select_atoms("protein")
+    if len(protein.residues) != 84:
+        raise ValueError(f"Expected two 42-residue monomers; found "
+                         f"{len(protein.residues)} protein residues")
+
+    # Omit hydrogens, including atom names beginning with a digit (e.g. 1H).
+    is_heavy = [not a.name.lstrip("0123456789").upper().startswith("H")
+                for a in protein]
+    heavy = protein[np.asarray(is_heavy, dtype=bool)]
+    residue_ids, counts = np.unique(heavy.resindices, return_counts=True)
+    if len(residue_ids) != 84 or np.any(np.diff(heavy.resindices) < 0):
+        raise ValueError("Protein heavy atoms must be ordered into 84 residues")
+
+    split = int(counts[:42].sum())
+    chain_a = heavy[:split]
+    chain_b = heavy[split:]
+    start_a = np.r_[0, np.cumsum(counts[:42])[:-1]]
+    start_b = np.r_[0, np.cumsum(counts[42:])[:-1]]
+    print(f"Monomer A: {len(chain_a)} heavy atoms; "
+          f"monomer B: {len(chain_b)} heavy atoms")
+
+    summed = np.zeros((42, 42), dtype=float)  # rows B; columns A
+    nframes = 0
+    first_ns = last_ns = None
+    for ts in u.trajectory[::args.stride]:
+        t_ns = ts.time / 1000.0  # ps -> ns
+        if t_ns < args.start_ns - 1e-8 or t_ns > args.end_ns + 1e-8:
+            continue
+        if ts.dimensions is None or np.any(ts.dimensions[:3] <= 0):
+            raise ValueError(f"No periodic box for frame {ts.frame}")
+
+        # Each frame: closest heavy-atom distance per residue pair, using PBC.
+        atom_dist = distance_array(chain_a.positions, chain_b.positions,
+                                   box=ts.dimensions)  # Å
+        by_a = np.minimum.reduceat(atom_dist, start_a, axis=0)
+        min_a_b = np.minimum.reduceat(by_a, start_b, axis=1)
+        summed += 0.1 * min_a_b.T  # rows B; columns A; Å -> nm
+        nframes += 1
+        if first_ns is None:
+            first_ns = t_ns
+        last_ns = t_ns
+        if nframes % 500 == 0:
+            print(f"Analyzed {nframes} frames, through {last_ns:g} ns")
+
+    if nframes == 0:
+        raise ValueError("No frames in requested time interval")
+    mean_nm = summed / nframes
+
+    png_name = f"{args.prefix}.png"
+    csv_name = f"{args.prefix}.csv"
+    np.savetxt(csv_name, mean_nm, delimiter=",", fmt="%.5f",
+               header="Rows: monomer B residues 1-42; columns: monomer A residues 1-42 (nm)")
+
+    # Reference-like palette; cyan represents distances at or above 0.5 nm.
+    cmap = LinearSegmentedColormap.from_list("distance", [
+        (0.0, "#19a847"), (0.2, "#ffe731"), (0.4, "#fa4357"),
+        (0.6, "#dd12b9"), (0.8, "#172aa9"), (1.0, "#08b9dc")
+    ])
+    cmap.set_over("#08b9dc")
+
+    fig, ax = plt.subplots(figsize=(7.4, 6.8), constrained_layout=True)
+    im = ax.imshow(mean_nm, origin="lower", interpolation="nearest",
+                   extent=(0.5, 42.5, 0.5, 42.5), aspect="equal",
+                   cmap=cmap, vmin=0.0, vmax=0.5)
+    ticks = [1, 5, 10, 15, 20, 25, 30, 35, 40, 42]
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_xlabel("Monomer A residue number")
+    ax.set_ylabel("Monomer B residue number")
+    ax.set_title("NCAP dimer: mean smallest interchain distance\n"
+                 f"{first_ns:g}–{last_ns:g} ns ({nframes} frames)")
+    cb = fig.colorbar(im, ax=ax, extend="max", shrink=0.85)
+    cb.set_label("Mean minimum heavy-atom distance (nm)")
+    fig.savefig(png_name, dpi=300)
+    plt.close(fig)
+    print(f"Saved {png_name} and {csv_name}")
+    print("Each pixel averages per-frame minimum distances, not contact occupancy.")
+
+
+if __name__ == "__main__":
+    main()
