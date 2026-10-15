@@ -1,114 +1,422 @@
 #!/usr/bin/env python3
-"""XP dimer mean minimum interchain residue distance, 50–100 ns.
+"""RESIDUE DISTANCE / CONTACT ANALYSIS — GROMACS AND OTHER MD SYSTEMS.
 
-Run inside ncap_system:
-    python ncap_mean_smallest_distance.py dimer_fresh.pdb dimer_fresh.xtc
+QUICK START
+-----------
+1. Install:   python3 -m pip install numpy matplotlib MDAnalysis
+2. Open THIS script and edit the clearly marked USER SETTINGS section below.
+3. Put the PDB/GRO/TPR and matching XTC in your working folder, or use full paths.
+4. Run:       python3 residue_distance_analysis.py
 
-Assumes first 42 protein residues are monomer A, next 42 monomer B.
+NO command-line arguments are necessary. Advanced users can override settings:
+    python3 residue_distance_analysis.py complex.tpr md.xtc \
+        --group-a 'protein' --group-b 'resname JZ4' --start-ns 20
+
+INPUT RULE: topology and trajectory MUST contain the SAME ATOMS in SAME ORDER.
+For PBC analysis, the trajectory must have valid simulation box dimensions.
+
+WHAT IS MEASURED?
+- Mean of the per-frame minimum atom-atom distances between residues of A and B.
+- Percentage of selected frames with residue-pair distance below the contact cutoff.
+- Rows of output maps = Group B, columns = Group A.
 """
 
 import argparse
+import csv
+import re
+from collections import Counter
+from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")                 # Save figures even on a headless HPC node.
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 import MDAnalysis as mda
 from MDAnalysis.lib.distances import distance_array
 import numpy as np
 
+# ============================================================================
+#                  USER SETTINGS — CHANGE ONLY THIS SECTION
+# ============================================================================
+# EXAMPLE SETUP: Aβ42 dimer, two 42-residue monomers, 50–100 ns analysis.
+# When you analyze a NEW system, update items 1–6 below.
+# Everything below the END OF USER SETTINGS line works automatically.
+
+# 1. REQUIRED FILES. Can be filenames in the current directory OR full paths.
+#    PDB/GRO/TPR describes atoms/residues; XTC/TRR contains trajectory frames.
+TOPOLOGY_FILE = "dimer_fresh.pdb"         # <-- CHANGE this to your PDB/GRO/TPR
+TRAJECTORY_FILE = "dimer_fresh.xtc"       # <-- CHANGE this to your XTC/TRR
+
+# 2. HOW TO CHOOSE THE TWO GROUPS?
+#    "split" = easiest for a dimer whose residues are arranged A first, B second
+#              in the TOPOLOGY file. No PDB chain IDs needed.
+#    "selection" = choose groups explicitly (protein–ligand, chains, polymers,
+#                  arbitrary groups). Useful for almost any other system.
+GROUP_MODE = "split"                     # <-- CHANGE to "selection" if needed
+
+# Only used in GROUP_MODE = "split":
+SPLIT_FROM = "protein"                    # Residues to split, in topology order
+N_RESIDUES_A = 42                         # <-- Number of residues in first group
+N_RESIDUES_B = 42                         # <-- Expected residues in second group
+
+# Only used in GROUP_MODE = "selection":
+# Examples of selections (choose ONE expression for each group):
+#   "protein and chainID A"    (PDB with chain A)
+#   "protein and chainID B"    (PDB with chain B)
+#   "segid A"                  (when segment IDs exist)
+#   "bynum 1:627"              (atoms 1–627, 1-based, check your atom order)
+#   "resname JZ4"              (ligand named JZ4)
+#   "protein"                  (all protein residues)
+GROUP_A_SELECTION = "protein and chainID A"  # <-- EDIT if using "selection"
+GROUP_B_SELECTION = "protein and chainID B"  # <-- EDIT if using "selection"
+
+# Names shown on the graph axes (not used for identifying atoms):
+LABEL_A = "Monomer A"                     # <-- Your X-axis group name
+LABEL_B = "Monomer B"                     # <-- Your Y-axis group name
+
+# 3. TIME TO ANALYZE (in NANOSECONDS, not picoseconds):
+START_NS = 50.0                           # <-- e.g., 50 analyzes from 50 ns
+END_NS = 100.0                            # <-- None means until final frame
+STRIDE = 1                                # 1 = every saved frame; 5 = every 5th
+
+# 4. CONTACT CUTOFF and COLOR SCALE (in nm):
+CONTACT_CUTOFF_NM = 0.45                 # <-- Contacts if d_min < 0.45 nm
+PLOT_MAX_NM = 0.50                       # <-- Color at/above 0.5 nm saturates
+                                        #     None = auto range
+
+# 5. OUTPUT NAME (files are written into this directory, if specified):
+OUTPUT_PREFIX = "results/ncap_50_100ns"    # <-- e.g., "results/my_dimer"
+
+# 6. OPTIONAL SETTINGS. In most simulations, DO NOT change these:
+USE_PBC = True                           # True = minimum-image PBC distances
+INCLUDE_HYDROGENS = False                # False = heavy-atom contacts
+BLOCK_RESIDUES = 20                      # smaller if memory is limited
+
+# ======================= END OF USER SETTINGS ===============================
+
+
+def parse_arguments():
+    """Use the easy settings above, with optional advanced CLI overrides."""
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("topology", nargs="?", default=TOPOLOGY_FILE,
+                   help=f"Topology (default from USER SETTINGS: {TOPOLOGY_FILE})")
+    p.add_argument("trajectory", nargs="?", default=TRAJECTORY_FILE,
+                   help=f"Trajectory (default from USER SETTINGS: {TRAJECTORY_FILE})")
+    p.add_argument("--mode", choices=("split", "selection"), default=None)
+    p.add_argument("--split-from", default=SPLIT_FROM,
+                   help="Group to split into first N residues and remaining residues")
+    p.add_argument("--n-residues-a", type=int, default=N_RESIDUES_A)
+    p.add_argument("--n-residues-b", type=int, default=N_RESIDUES_B)
+    p.add_argument("--group-a", default=None, help="MDAnalysis selection for group A")
+    p.add_argument("--group-b", default=None, help="MDAnalysis selection for group B")
+    p.add_argument("--label-a", default=LABEL_A)
+    p.add_argument("--label-b", default=LABEL_B)
+    p.add_argument("--start-ns", type=float, default=START_NS)
+    p.add_argument("--end-ns", type=float, default=END_NS)
+    p.add_argument("--stride", type=int, default=STRIDE)
+    p.add_argument("--cutoff-nm", type=float, default=CONTACT_CUTOFF_NM)
+    p.add_argument("--include-hydrogens", action="store_true", default=INCLUDE_HYDROGENS)
+    p.add_argument("--no-pbc", action="store_true", default=not USE_PBC)
+    p.add_argument("--block-residues", type=int, default=BLOCK_RESIDUES)
+    p.add_argument("--plot-max-nm", type=float, default=PLOT_MAX_NM)
+    p.add_argument("--prefix", default=OUTPUT_PREFIX)
+    args = p.parse_args()
+
+    # If both --group-a and --group-b are supplied, assume an explicit selection.
+    # This preserves compatibility with the more advanced command-line version.
+    if (args.group_a is None) != (args.group_b is None):
+        p.error("Specify BOTH --group-a and --group-b, or neither")
+    args.mode = args.mode or (
+        "selection" if args.group_a is not None else GROUP_MODE
+    )
+    args.group_a = args.group_a or GROUP_A_SELECTION
+    args.group_b = args.group_b or GROUP_B_SELECTION
+
+    if args.mode not in ("split", "selection"):
+        p.error('GROUP_MODE must be "split" or "selection"')
+    if args.stride < 1 or args.block_residues < 1:
+        p.error("STRIDE and BLOCK_RESIDUES must be positive integers")
+    if args.cutoff_nm <= 0 or args.start_ns < 0:
+        p.error("CONTACT_CUTOFF_NM must be > 0 and START_NS >= 0")
+    if args.end_ns is not None and args.end_ns < args.start_ns:
+        p.error("END_NS must be >= START_NS (or None)")
+    if args.plot_max_nm is not None and args.plot_max_nm <= 0:
+        p.error("PLOT_MAX_NM must be positive or None")
+    if args.mode == "split" and (args.n_residues_a < 1 or args.n_residues_b < 1):
+        p.error("N_RESIDUES_A and N_RESIDUES_B must be positive")
+    return args
+
+
+def get_groups(universe, args):
+    """Return both atom groups, using simple residue split or manual selections."""
+    if args.mode == "selection":
+        return (universe.select_atoms(args.group_a),
+                universe.select_atoms(args.group_b))
+
+    # In split mode, define the groups by residue ordering in the input topology.
+    source = universe.select_atoms(args.split_from)
+    residue_count = len(source.residues)
+    expected = args.n_residues_a + args.n_residues_b
+    if residue_count != expected:
+        raise ValueError(
+            f'GROUP_MODE="split": selection {args.split_from!r} has '
+            f'{residue_count} residues, but you configured '
+            f'N_RESIDUES_A={args.n_residues_a} and '
+            f'N_RESIDUES_B={args.n_residues_b} (total {expected}). '
+            'Change the residue numbers in USER SETTINGS, or use '
+            'GROUP_MODE="selection".'
+        )
+    indices_a = source.residues[:args.n_residues_a].resindices
+    indices_b = source.residues[args.n_residues_a:].resindices
+    atoms_a = source[np.isin(source.resindices, indices_a)]
+    atoms_b = source[np.isin(source.resindices, indices_b)]
+    return atoms_a, atoms_b
+
+
+def only_heavy_atoms(group, include_hydrogens=False):
+    """Prefer element metadata for recognizing H/D; otherwise use atom names."""
+    if include_hydrogens:
+        return group
+    elements = getattr(group, "elements", None)
+    if elements is not None and all(str(el).strip() for el in elements):
+        keep = [str(el).strip().upper() not in ("H", "D") for el in elements]
+    else:
+        # Common names: H, HA, HB2, 1HB, 2H. This is a naming heuristic.
+        keep = [not re.sub(r"^\d+", "", atom.name).upper().startswith(("H", "D"))
+                for atom in group]
+    return group[np.asarray(keep, dtype=bool)]
+
+
+def group_by_residue(group, universe):
+    """Put atoms of each residue together and remember their start positions."""
+    if len(group) == 0:
+        raise ValueError("A group contains zero atoms after filtering hydrogens")
+    order = np.argsort(group.resindices, kind="stable")
+    atoms = group[order]
+    res_indices, counts = np.unique(atoms.resindices, return_counts=True)
+    starts = np.r_[0, np.cumsum(counts)[:-1]].astype(int)
+    ends = np.cumsum(counts).astype(int)
+    residues = [universe.residues[int(index)] for index in res_indices]
+    return atoms, starts, ends, residues, res_indices
+
+
+def residue_label(residue):
+    """Human-readable label: chain, residue name and residue number."""
+    try:
+        chain_id = str(residue.atoms[0].chainID).strip()
+    except (AttributeError, mda.exceptions.NoDataError):
+        chain_id = ""
+    segid = str(residue.segid).strip()
+    prefix = chain_id or (segid if segid not in ("SYSTEM", "X") else "")
+    return f"{prefix + ':' if prefix else ''}{residue.resname}{residue.resid}"
+
+
+def residue_labels(residues):
+    """Disambiguate repeated residue numbers, e.g., two copies of one ligand."""
+    raw = [residue_label(r) for r in residues]
+    tally = Counter(raw)
+    return [f"{label}[resindex={r.resindex}]" if tally[label] > 1 else label
+            for label, r in zip(raw, residues)]
+
+
+def save_labeled_csv(filename, array, row_labels, column_labels):
+    """Rows are group B residues; columns are group A residues."""
+    with open(filename, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["B \\ A", *column_labels])
+        for label, row in zip(row_labels, array):
+            writer.writerow([label, *[f"{x:.5f}" for x in row]])
+
+
+def residue_distance_matrix(atoms_a, starts_a, ends_a,
+                            atoms_b, starts_b, ends_b, box, block_residues):
+    """Minimum heavy-atom distance per residue pair in ONE frame, in nm.
+
+    This processes groups in residue blocks to avoid allocating a huge
+    all-atoms-by-all-atoms distance matrix for large proteins.
+    The returned matrix has rows = B residues, columns = A residues.
+    """
+    n_a, n_b = len(starts_a), len(starts_b)
+    out = np.empty((n_b, n_a), dtype=np.float64)
+
+    for ia in range(0, n_a, block_residues):
+        ja = min(ia + block_residues, n_a)
+        first_atom_a, end_atom_a = int(starts_a[ia]), int(ends_a[ja - 1])
+        chunk_a = atoms_a[first_atom_a:end_atom_a]
+        relative_starts_a = starts_a[ia:ja] - first_atom_a
+
+        for ib in range(0, n_b, block_residues):
+            jb = min(ib + block_residues, n_b)
+            first_atom_b, end_atom_b = int(starts_b[ib]), int(ends_b[jb - 1])
+            chunk_b = atoms_b[first_atom_b:end_atom_b]
+            relative_starts_b = starts_b[ib:jb] - first_atom_b
+
+            # MDAnalysis returns distances in Å by default.
+            atom_dist = distance_array(chunk_a.positions, chunk_b.positions, box=box)
+            minimum_a = np.minimum.reduceat(atom_dist, relative_starts_a, axis=0)
+            minimum_ab = np.minimum.reduceat(minimum_a, relative_starts_b, axis=1)
+            out[ib:jb, ia:ja] = 0.1 * minimum_ab.T  # Å -> nm; B rows, A columns
+
+    return out
+
+
+def make_heatmap(matrix, xlabels, ylabels, title, xname, yname,
+                 colorbar_label, filename, cmap, vmin, vmax, upper_extension=False):
+    n_b, n_a = matrix.shape
+    fig_width = min(13, max(6.5, n_a * 0.15))
+    fig_height = min(12, max(5.5, n_b * 0.15))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), constrained_layout=True)
+    im = ax.imshow(matrix, origin="lower", interpolation="nearest", aspect="auto",
+                   cmap=cmap, vmin=vmin, vmax=vmax)
+
+    # Avoid unreadable labels when the groups contain hundreds of residues.
+    xticks = np.unique(np.linspace(0, n_a - 1, min(n_a, 12), dtype=int))
+    yticks = np.unique(np.linspace(0, n_b - 1, min(n_b, 12), dtype=int))
+    ax.set_xticks(xticks, [xlabels[i] for i in xticks], rotation=60, ha="right")
+    ax.set_yticks(yticks, [ylabels[i] for i in yticks])
+    ax.set_xlabel(f"{xname} residues")
+    ax.set_ylabel(f"{yname} residues")
+    ax.set_title(title)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85,
+                        extend="max" if upper_extension else "neither")
+    cbar.set_label(colorbar_label)
+    fig.savefig(filename, dpi=300)
+    plt.close(fig)
+
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("topology", help="Protein-only PDB matching trajectory atom order")
-    p.add_argument("trajectory", help="Protein-only XTC with periodic box")
-    p.add_argument("--start-ns", type=float, default=50.0)
-    p.add_argument("--end-ns", type=float, default=100.0)
-    p.add_argument("--stride", type=int, default=1,
-                   help="Analyze every nth saved frame (default: every frame)")
-    p.add_argument("--prefix", default="ncap_B_vs_A_50_100ns")
-    args = p.parse_args()
-    if args.stride < 1 or args.end_ns < args.start_ns:
-        p.error("Need stride >= 1 and end-ns >= start-ns")
+    args = parse_arguments()
+    prefix = Path(args.prefix)
+    prefix.parent.mkdir(parents=True, exist_ok=True)
 
+    # The structure and trajectory MUST describe atoms in exactly the same order.
+    if not Path(args.topology).is_file():
+        raise FileNotFoundError(
+            f"Topology not found: {args.topology}. Change TOPOLOGY_FILE in USER SETTINGS.")
+    if not Path(args.trajectory).is_file():
+        raise FileNotFoundError(
+            f"Trajectory not found: {args.trajectory}. Change TRAJECTORY_FILE in USER SETTINGS.")
+    print("Reading topology and trajectory...")
     u = mda.Universe(args.topology, args.trajectory)
-    protein = u.select_atoms("protein")
-    if len(protein.residues) != 84:
-        raise ValueError(f"Expected two 42-residue monomers; found "
-                         f"{len(protein.residues)} protein residues")
+    group_a, group_b = get_groups(u, args)
+    if len(group_a) == 0 or len(group_b) == 0:
+        raise ValueError("One group is empty. Check --group-a/--group-b selections.")
+    if np.intersect1d(group_a.indices, group_b.indices).size:
+        raise ValueError("Groups A and B contain overlapping atoms; use separate groups")
 
-    # Omit hydrogens, including atom names beginning with a digit (e.g. 1H).
-    is_heavy = [not a.name.lstrip("0123456789").upper().startswith("H")
-                for a in protein]
-    heavy = protein[np.asarray(is_heavy, dtype=bool)]
-    residue_ids, counts = np.unique(heavy.resindices, return_counts=True)
-    if len(residue_ids) != 84 or np.any(np.diff(heavy.resindices) < 0):
-        raise ValueError("Protein heavy atoms must be ordered into 84 residues")
+    atoms_a, start_a, end_a, residues_a, resindex_a = group_by_residue(
+        only_heavy_atoms(group_a, args.include_hydrogens), u)
+    atoms_b, start_b, end_b, residues_b, resindex_b = group_by_residue(
+        only_heavy_atoms(group_b, args.include_hydrogens), u)
+    if np.intersect1d(resindex_a, resindex_b).size:
+        raise ValueError("Group A and B share residue(s); choose distinct residue groups")
 
-    split = int(counts[:42].sum())
-    chain_a = heavy[:split]
-    chain_b = heavy[split:]
-    start_a = np.r_[0, np.cumsum(counts[:42])[:-1]]
-    start_b = np.r_[0, np.cumsum(counts[42:])[:-1]]
-    print(f"Monomer A: {len(chain_a)} heavy atoms; "
-          f"monomer B: {len(chain_b)} heavy atoms")
+    n_a, n_b = len(residues_a), len(residues_b)
+    print(f"Group A ({args.label_a}): {len(atoms_a)} atoms across {n_a} residues")
+    print(f"  First / last residue: {residue_label(residues_a[0])} / "
+          f"{residue_label(residues_a[-1])}")
+    print(f"Group B ({args.label_b}): {len(atoms_b)} atoms across {n_b} residues")
+    print(f"  First / last residue: {residue_label(residues_b[0])} / "
+          f"{residue_label(residues_b[-1])}")
+    print("CHECK ABOVE: Do these groups correspond to the intended molecules?")
+    print(f"Interval: {args.start_ns:g} to "
+          f"{args.end_ns if args.end_ns is not None else 'trajectory end'} ns")
+    print(f"PBC: {'disabled' if args.no_pbc else 'minimum-image'}")
 
-    summed = np.zeros((42, 42), dtype=float)  # rows B; columns A
-    nframes = 0
-    first_ns = last_ns = None
+    # Rows = residues of group B; columns = residues of group A.
+    total_distance_nm = np.zeros((n_b, n_a), dtype=np.float64)
+    contact_counts = np.zeros((n_b, n_a), dtype=np.int64)
+    nframes, first_ns, last_ns = 0, None, None
+
     for ts in u.trajectory[::args.stride]:
-        t_ns = ts.time / 1000.0  # ps -> ns
-        if t_ns < args.start_ns - 1e-8 or t_ns > args.end_ns + 1e-8:
+        time_ns = float(ts.time) / 1000.0  # GROMACS ps -> ns
+        if time_ns < args.start_ns - 1e-8:
             continue
-        if ts.dimensions is None or np.any(ts.dimensions[:3] <= 0):
-            raise ValueError(f"No periodic box for frame {ts.frame}")
+        if args.end_ns is not None and time_ns > args.end_ns + 1e-8:
+            continue
 
-        # Each frame: closest heavy-atom distance per residue pair, using PBC.
-        atom_dist = distance_array(chain_a.positions, chain_b.positions,
-                                   box=ts.dimensions)  # Å
-        by_a = np.minimum.reduceat(atom_dist, start_a, axis=0)
-        min_a_b = np.minimum.reduceat(by_a, start_b, axis=1)
-        summed += 0.1 * min_a_b.T  # rows B; columns A; Å -> nm
+        if args.no_pbc:
+            box = None
+        else:
+            box = ts.dimensions  # [Lx, Ly, Lz, alpha, beta, gamma] (Å/degrees)
+            if box is None or len(box) < 6 or not np.all(np.isfinite(box)) \
+                    or np.any(np.asarray(box[:3]) <= 0):
+                raise ValueError(f"Frame {ts.frame} has no valid periodic box. "
+                                 "Provide box data or use --no-pbc if appropriate.")
+
+        distances_nm = residue_distance_matrix(
+            atoms_a, start_a, end_a, atoms_b, start_b, end_b,
+            box, args.block_residues,
+        )
+        total_distance_nm += distances_nm
+        contact_counts += (distances_nm < args.cutoff_nm)
         nframes += 1
         if first_ns is None:
-            first_ns = t_ns
-        last_ns = t_ns
+            first_ns = time_ns
+        last_ns = time_ns
         if nframes % 500 == 0:
-            print(f"Analyzed {nframes} frames, through {last_ns:g} ns")
+            print(f"  Processed {nframes} frames; time = {last_ns:.3f} ns", flush=True)
 
-    if nframes == 0:
-        raise ValueError("No frames in requested time interval")
-    mean_nm = summed / nframes
+    if not nframes:
+        raise ValueError("No frames in the requested interval. Check trajectory times.")
+    mean_nm = total_distance_nm / nframes
+    occupancy_percent = 100.0 * contact_counts / nframes
 
-    png_name = f"{args.prefix}.png"
-    csv_name = f"{args.prefix}.csv"
-    np.savetxt(csv_name, mean_nm, delimiter=",", fmt="%.5f",
-               header="Rows: monomer B residues 1-42; columns: monomer A residues 1-42 (nm)")
+    labels_a = residue_labels(residues_a)
+    labels_b = residue_labels(residues_b)
+    mean_csv = f"{prefix}_mean_distance_nm.csv"
+    occ_csv = f"{prefix}_contact_occupancy_percent.csv"
+    mean_png = f"{prefix}_mean_distance.png"
+    occ_png = f"{prefix}_contact_occupancy.png"
+    info_txt = f"{prefix}_info.txt"
 
-    # Reference-like palette; cyan represents distances at or above 0.5 nm.
-    cmap = LinearSegmentedColormap.from_list("distance", [
-        (0.0, "#19a847"), (0.2, "#ffe731"), (0.4, "#fa4357"),
-        (0.6, "#dd12b9"), (0.8, "#172aa9"), (1.0, "#08b9dc")
-    ])
-    cmap.set_over("#08b9dc")
+    save_labeled_csv(mean_csv, mean_nm, labels_b, labels_a)
+    save_labeled_csv(occ_csv, occupancy_percent, labels_b, labels_a)
 
-    fig, ax = plt.subplots(figsize=(7.4, 6.8), constrained_layout=True)
-    im = ax.imshow(mean_nm, origin="lower", interpolation="nearest",
-                   extent=(0.5, 42.5, 0.5, 42.5), aspect="equal",
-                   cmap=cmap, vmin=0.0, vmax=0.5)
-    ticks = [1, 5, 10, 15, 20, 25, 30, 35, 40, 42]
-    ax.set_xticks(ticks)
-    ax.set_yticks(ticks)
-    ax.set_xlabel("Monomer A residue number")
-    ax.set_ylabel("Monomer B residue number")
-    ax.set_title("NCAP dimer: mean smallest interchain distance\n"
-                 f"{first_ns:g}–{last_ns:g} ns ({nframes} frames)")
-    cb = fig.colorbar(im, ax=ax, extend="max", shrink=0.85)
-    cb.set_label("Mean minimum heavy-atom distance (nm)")
-    fig.savefig(png_name, dpi=300)
-    plt.close(fig)
-    print(f"Saved {png_name} and {csv_name}")
-    print("Each pixel averages per-frame minimum distances, not contact occupancy.")
+    distance_max = args.plot_max_nm if args.plot_max_nm is not None \
+        else max(float(np.max(mean_nm)), 0.001)
+    duration = f"{first_ns:g}–{last_ns:g} ns; {nframes} frames"
+    make_heatmap(mean_nm, labels_a, labels_b,
+                 f"Mean minimum inter-residue distance ({duration})",
+                 args.label_a, args.label_b,
+                 "Mean minimum atom distance (nm)", mean_png,
+                 "viridis_r", 0, distance_max,
+                 upper_extension=bool(np.max(mean_nm) > distance_max))
+    make_heatmap(occupancy_percent, labels_a, labels_b,
+                 f"Residue contact occupancy ({duration})",
+                 args.label_a, args.label_b,
+                 f"Contact occupancy (%; distance < {args.cutoff_nm:g} nm)",
+                 occ_png, "viridis", 0, 100)
+
+    with open(info_txt, "w") as handle:
+        handle.write(f"Topology: {args.topology}\nTrajectory: {args.trajectory}\n")
+        handle.write(f"Mode: {args.mode}\n")
+        if args.mode == "split":
+            handle.write(f"Split selection: {args.split_from}\n")
+            handle.write(f"Split residues: A={args.n_residues_a}, "
+                         f"B={args.n_residues_b}\n")
+        else:
+            handle.write(f"Group A ({args.label_a}): {args.group_a}\n")
+            handle.write(f"Group B ({args.label_b}): {args.group_b}\n")
+        handle.write(f"Group A residues: {n_a}; atoms analyzed: {len(atoms_a)}\n")
+        handle.write(f"Group B residues: {n_b}; atoms analyzed: {len(atoms_b)}\n")
+        handle.write(f"Requested interval: {args.start_ns:g} to {args.end_ns} ns\n")
+        handle.write(f"Actual interval: {first_ns:g} to {last_ns:g} ns\n")
+        handle.write(f"Frames analyzed: {nframes}; stride: {args.stride}\n")
+        handle.write(f"Contact cutoff: {args.cutoff_nm} nm (strictly less)\n")
+        handle.write(f"PBC: {'off' if args.no_pbc else 'minimum-image'}\n")
+        handle.write("CSV rows: Group B; columns: Group A\n")
+        handle.write("Distance: time average of the minimum atom-atom distance "
+                     "for each residue pair in each frame.\n")
+        handle.write("Occupancy: percent of analyzed frames whose minimum "
+                     "atom-atom distance is below the contact cutoff.\n")
+    print(f"Analyzed {nframes} frames, from {first_ns:g} to {last_ns:g} ns")
+    print("Files created:")
+    for filename in (mean_csv, occ_csv, mean_png, occ_png, info_txt):
+        print(" ", filename)
+    print("CSV rows = Group B residues; CSV columns = Group A residues.")
 
 
 if __name__ == "__main__":
